@@ -4,7 +4,7 @@ on:
   push:
     branches: [ main ]
     paths-ignore:
-      - 'kubernetes/deployment.yaml'  # Ignore changes to this file to prevent loops
+      - 'kubernetes/deployment.yaml'  # Ignore to prevent CI loops
   pull_request:
     branches: [ main ]
 
@@ -76,7 +76,7 @@ jobs:
           path: dist/
 
   docker:
-    name: Docker Build and Push
+    name: Docker Build, Scan, and Push
     runs-on: ubuntu-latest
     needs: [build]
     env:
@@ -87,43 +87,33 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-      
+
       - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
           name: build-artifacts
           path: dist/
-      
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-      
+
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.TOKEN }}
-      
+
       - name: Extract metadata for Docker
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=sha,format=long
-            type=ref,event=branch
+            type=sha,format=short
             latest
-      
-      - name: Build Docker image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          push: false
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          load: true
-      
-      - name: Push Docker image
+
+      - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -131,20 +121,26 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 
+      - name: Extract single image tag for Trivy
+        id: extract_tag
+        run: |
+          echo "TRIVY_TAG=$(echo '${{ steps.meta.outputs.tags }}' | head -n 1)" >> $GITHUB_ENV
+
       - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@master
         with:
-          image-ref: ${{ steps.meta.outputs.tags }}
+          image-ref: ${{ env.TRIVY_TAG }}
           format: 'table'
           exit-code: '1'
           ignore-unfixed: true
           vuln-type: 'os,library'
           severity: 'CRITICAL,HIGH'
 
-      
       - name: Set image tag output
         id: set_output
-        run: echo "image_tag=$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
+        run: |
+          echo "image_tag=$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
+          echo "IMAGE_FULL_TAG=${{ env.TRIVY_TAG }}" >> $GITHUB_ENV
 
   update-k8s:
     name: Update Kubernetes Deployment
@@ -156,28 +152,23 @@ jobs:
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.TOKEN }}
-      
+
       - name: Setup Git config
         run: |
           git config user.name "GitHub Actions"
           git config user.email "actions@github.com"
-      
+
       - name: Update Kubernetes deployment file
         env:
-          IMAGE_TAG: sha-${{ github.sha }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
+          NEW_IMAGE: ${{ needs.docker.outputs.image_tag }}
           REGISTRY: ghcr.io
+          GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
-          # Define the new image with tag
-          NEW_IMAGE="${REGISTRY}/${GITHUB_REPOSITORY}:${IMAGE_TAG}"
-          
-          # Update the deployment file directly
-          sed -i "s|image: ${REGISTRY}/.*|image: ${NEW_IMAGE}|g" kubernetes/deployment.yaml
-          
-          # Verify the change
-          echo "Updated deployment to use image: ${NEW_IMAGE}"
+          IMAGE="${REGISTRY}/${GITHUB_REPOSITORY}:sha-${{ github.sha }}"
+          sed -i "s|image: ${REGISTRY}/.*|image: ${IMAGE}|g" kubernetes/deployment.yaml
+          echo "Updated deployment to use image: ${IMAGE}"
           grep -A 1 "image:" kubernetes/deployment.yaml
-      
+
       - name: Commit and push changes
         run: |
           git add kubernetes/deployment.yaml
